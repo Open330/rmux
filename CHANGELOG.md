@@ -44,6 +44,14 @@
 
 ### Reliability and performance
 
+- Send only changed self-contained popup rows during child-output refreshes,
+  while retaining full frames for client refresh, resize, overlay replacement,
+  and screen restoration. Identical popup frames produce no terminal output;
+  overlapping drawing operations conservatively retain full-frame rendering.
+- Batch Unix popup PTY reads using an 8 ms window and a 256 KiB limit, so
+  split TUI writes do not trigger a full popup refresh for every read. Idle
+  popups remain asleep and sustained output cannot extend the batch deadline.
+
 - Defer periodic status frames while their region intersects a popup or menu,
   including nested popup menus and top or multi-row status bars. Status bars
   outside the overlay continue updating; overlapping bars resume after close.
