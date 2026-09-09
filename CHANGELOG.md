@@ -44,6 +44,10 @@
 
 ### Reliability and performance
 
+- Defer periodic status frames while their region intersects a popup or menu,
+  including nested popup menus and top or multi-row status bars. Status bars
+  outside the overlay continue updating; overlapping bars resume after close.
+
 - Paint popup content rows directly in their final state instead of clearing
   the whole popup first. Shorter and missing rows still erase stale content;
   ANSI styles and Unicode clipping are preserved. This removes the blank
