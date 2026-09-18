@@ -815,6 +815,63 @@ fn two_pane_sessions_render_the_main_vertical_border_column_and_exact_frame_byte
 }
 
 #[test]
+fn horizontal_borders_emit_one_cursor_jump_per_row_in_row_order() {
+    // The layout walk yields border cells column by column, so with two
+    // horizontal borders consecutive cells sit on different rows. Emitting them
+    // in that order costs one absolute cursor jump *per cell* — the dominant
+    // cost of every client refresh in a split window, since a refresh repaints
+    // the borders whether or not they changed.
+    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 9 });
+    session
+        .split_active_pane_with_direction(SplitDirection::Horizontal)
+        .expect("first split succeeds");
+    session
+        .split_active_pane_with_direction(SplitDirection::Horizontal)
+        .expect("second split succeeds");
+    let cells = border_cells(
+        session.window(),
+        session.active_pane_index(),
+        border_style(Some("red")),
+        border_style(Some("red")),
+    );
+    let border_rows: Vec<u16> = {
+        let mut rows: Vec<u16> = cells.iter().map(|cell| cell.y).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    };
+    assert_eq!(
+        border_rows.len(),
+        2,
+        "two horizontal borders, got {border_rows:?}"
+    );
+
+    let frame = super::render_cells(&cells);
+    assert_eq!(
+        frame.iter().filter(|byte| **byte == b'H').count(),
+        border_rows.len(),
+        "one cursor jump per border row, not one per cell: {:?}",
+        String::from_utf8_lossy(&frame),
+    );
+
+    // ...and the rows are painted top to bottom, so each run is contiguous.
+    let positions: Vec<usize> = border_rows
+        .iter()
+        .map(|row| {
+            let needle = format!("\x1b[{};1H", row + 1);
+            frame
+                .windows(needle.len())
+                .position(|window| window == needle.as_bytes())
+                .unwrap_or_else(|| panic!("row {row} must start a run"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "border rows must be emitted in ascending order, got {positions:?}",
+    );
+}
+
+#[test]
 fn two_pane_sessions_colour_only_the_active_half_of_the_shared_border() {
     let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
     session.split_active_pane().expect("split succeeds");

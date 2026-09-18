@@ -126,11 +126,23 @@ pub(super) fn render_cells(cells: &[BorderCell]) -> Vec<u8> {
 
     let mut frame = Vec::new();
     let mut last_style: Option<BorderStyle> = None;
+    // Where the terminal's cursor sits after the glyph we just wrote, so a run
+    // of cells along one row costs one jump instead of one per column.
+    let mut cursor: Option<(u16, u16)> = None;
+    // The layout walk yields the cells column by column, so on a window with
+    // several horizontal borders consecutive cells sit on different rows and
+    // no run can form. Each cell is an independent absolute write, so ordering
+    // them by row costs nothing and turns every border row into one run. The
+    // sort is stable, so cells that share a position keep last-one-wins.
+    let mut ordered: Vec<&BorderCell> = cells.iter().collect();
+    ordered.sort_by_key(|cell| (cell.y, cell.x));
     frame.extend_from_slice(b"\x1b[s");
     frame.extend_from_slice(b"\x1b[0m");
 
-    for cell in cells {
-        frame.extend_from_slice(cursor_position_bytes(cell.y, cell.x).as_slice());
+    for cell in ordered {
+        if cursor != Some((cell.y, cell.x)) {
+            frame.extend_from_slice(cursor_position_bytes(cell.y, cell.x).as_slice());
+        }
         if last_style.as_ref() != Some(&cell.style) {
             if last_style.is_some() {
                 frame.extend_from_slice(b"\x1b[0m");
@@ -140,10 +152,23 @@ pub(super) fn render_cells(cells: &[BorderCell]) -> Vec<u8> {
         }
         let mut utf8 = [0_u8; 4];
         frame.extend_from_slice(cell.glyph.encode_utf8(&mut utf8).as_bytes());
+        // Only glyphs known to occupy exactly one column may carry the cursor
+        // forward; anything else re-positions explicitly on the next cell.
+        cursor = advances_one_column(cell.glyph)
+            .then(|| cell.x.checked_add(1).map(|x| (cell.y, x)))
+            .flatten();
     }
 
     frame.extend_from_slice(b"\x1b[0m\x1b[u");
     frame
+}
+
+/// Single-column glyphs: printable ASCII and the Box Drawing block, which is
+/// every glyph the built-in border styles use. Anything else (a configured
+/// glyph that could be wide or combining) breaks the run rather than risk a
+/// cursor that has moved somewhere we did not predict.
+const fn advances_one_column(glyph: char) -> bool {
+    matches!(glyph, ' '..='~' | '\u{2500}'..='\u{257f}')
 }
 
 pub(super) type BorderStyle = Style;
