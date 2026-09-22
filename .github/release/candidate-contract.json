@@ -411,6 +411,7 @@
     "scripts/audit-await-holding-lock.sh",
     "scripts/bench/bench_unix.py",
     "scripts/bench/collect.py",
+    "scripts/bench/popup_unix.py",
     "scripts/bench/render.py",
     "scripts/bench/run-unix.sh",
     "scripts/bench/run-windows.ps1",

@@ -76,3 +76,26 @@ or a guarantee that every terminal's visible flicker is gone.
 
 The running daemon must use the new build to benefit. Replacing the CLI file
 alone does not update an already running server's renderer.
+
+
+## Checking whether the fix is running
+
+On Linux, compare the SHA-256 of `/proc/<daemon-pid>/exe` with the installed
+`rmux-daemon` file. A process can keep executing an older binary after the file
+has been replaced; the CLI version string alone does not establish which
+renderer a live server uses. Check the daemon serving the affected socket.
+
+A second isolated comparison on 2026-09-11 used a copy of the affected live
+server's executable as the baseline and the `dbbbbcc` build as the candidate.
+For the same recorded watch stream, each six-second sample produced:
+
+| Status | Running older build: bytes / row blocks | Candidate: bytes / row blocks |
+| --- | ---: | ---: |
+| Off | 89,221 / 429 | 564 / 3 |
+| On | 89,854 / 432 | 1,197 / 6 |
+
+These single samples confirm substantially less popup repaint output. They do
+not measure subjective flicker in every terminal or establish a CPU gain;
+compilation was running concurrently. They also do not diagnose flicker outside
+popups. Applying the renderer to an existing server requires a planned server
+restart; replacing the CLI or reloading the configuration is insufficient.

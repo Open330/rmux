@@ -44,6 +44,9 @@
 
 ### Reliability and performance
 
+- Reap `destroy-unattached` sessions after their last attached or control client
+  switches away, preserving grouped windows and sessions with other clients.
+
 - Send only changed self-contained popup rows during child-output refreshes,
   while retaining full frames for client refresh, resize, overlay replacement,
   and screen restoration. Identical popup frames produce no terminal output;
