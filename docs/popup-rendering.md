@@ -99,3 +99,61 @@ not measure subjective flicker in every terminal or establish a CPU gain;
 compilation was running concurrently. They also do not diagnose flicker outside
 popups. Applying the renderer to an existing server requires a planned server
 restart; replacing the CLI or reloading the configuration is insufficient.
+
+## Background output while a popup is open
+
+The row-diff optimization alone did not prevent background pane output from
+requesting a full attached-client refresh. That refresh cleared the screen,
+painted the base panes, and restored the popup. A busy active pane triggered this
+through the attach output scheduler; an inactive split pane triggered it through
+session-wide pane-alert refreshes.
+
+Persistent popups and menus now hold background screen updates until dismissal.
+PTY output continues to update the transcript and is drained normally, including
+output gaps; terminal passthroughs remain deferred. Clients without a popup still
+receive live output. Explicit refreshes and layout changes retain their normal
+behavior. Popup dismissal refreshes the base transcript even when output stopped
+while the popup was open, instead of depending on the next output event.
+
+Run the regression on a disposable server (requires Python 3 and Unix PTYs):
+
+```sh
+cargo build --bin rmux --bin rmux-daemon
+python3 scripts/check-popup-background.py
+python3 scripts/check-popup-background.py --muxa "$(command -v muxa)"
+python3 scripts/check-popup-background.py --muxa "$(command -v muxa)" --split
+```
+
+The check opens the popup with prefix+s, looks for underlying pane output and
+screen clears while it is open, then stops the producer before dismissal and
+requires the final output to appear. Muxa's own pane preview is allowed to show
+captured output; that is part of the popup, not an underlying pane repaint.
+`--rmux /path/to/rmux` selects a baseline/candidate and its sibling daemon.
+
+A three-second reproduction with installed muxa watch emitted 280,469 terminal
+bytes and 1,778 copies of the underlying pane marker before the active-pane fix,
+versus 564 bytes and zero underlying marker copies after it. Inactive split pane
+output required the separate per-client session refresh filter. A static popup
+without muxa also reproduced the bug, establishing that the contention is in
+rmux rather than the watch application. Byte counts depend on timing and terminal
+geometry; the regression asserts hidden output and fresh dismissal instead of an
+exact performance number.
+
+The change is daemon-side. Existing servers keep running their old code after
+installation. Validate on a fresh named socket before planning any restart of a
+server that owns live panes.
+
+Output-driven automatic window renames and the final alert flush at pane EOF
+use the same per-client overlay filter. Retiring a stale overlay also restores
+the latest base transcript, even if no transient message was visible.
+The background regression supports `--burst --split` to stress larger batches;
+its PATH is pinned to the selected rmux so nested muxa control commands use the
+same candidate as the disposable server.
+
+Popup navigation has a separate lifecycle constraint: switching a client's
+session terminates its old popup job. An application running inside that popup
+must prepare its destination window/pane and server-side cleanup before the
+switch, with no required subprocess commands afterwards. Muxa's regression is
+`scripts/rmux-popup-jump-check.py` in the muxa repository. It drives actual watch
+popups with prefix+s and Enter, including private views and production auto-view
+hooks; a jump test invoked outside a popup cannot detect this termination bug.

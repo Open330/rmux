@@ -757,9 +757,14 @@ pub(crate) async fn forward_attach(
                                 let _ = emit_attach_stop(&stream, &current_target).await;
                                 return Ok(());
                             }
+                            // Popups/menus own the visible surface until dismissal.
+                            // A timer queued before the overlay opened must not paint
+                            // the base pane underneath it and then restore the overlay.
+                            if persistent_overlay_visible || persistent_overlay.is_some() {
+                                pane_refresh_requires_full = true;
+                                continue;
+                            }
                             let force_full_refresh = pane_refresh_requires_full
-                                || persistent_overlay_visible
-                                || persistent_overlay.is_some()
                                 || current_target.live_pane.is_none();
                             pane_refresh_requires_full = false;
                             if force_full_refresh {
@@ -1364,10 +1369,11 @@ pub(crate) async fn forward_attach(
                             continue;
                         }
                         AttachOutputBatch::Gap => {
-                            if current_target.live_pane.is_none()
-                                || persistent_overlay_visible
-                                || persistent_overlay.is_some()
-                            {
+                            if persistent_overlay_visible || persistent_overlay.is_some() {
+                                pane_refresh_requires_full = true;
+                                continue;
+                            }
+                            if current_target.live_pane.is_none() {
                                 pane_refresh_requires_full = true;
                             }
                             pane_refresh.schedule_sustained();
@@ -1513,8 +1519,10 @@ pub(crate) async fn forward_attach(
                             }
                             if persistent_overlay_visible || persistent_overlay.is_some() {
                                 defer_passthroughs(&mut deferred_passthroughs, passthroughs);
+                                // Continue draining output into the transcript without
+                                // repainting the obscured pane. Clearing the overlay
+                                // requests a fresh base snapshot, including these bytes.
                                 pane_refresh_requires_full = true;
-                                pane_refresh.schedule_now();
                                 if close_after_render {
                                     current_target.pane_output = None;
                                 }
