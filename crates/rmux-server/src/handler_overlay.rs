@@ -1013,10 +1013,10 @@ impl RequestHandler {
                 _ => None,
             };
             active.overlay_generation = active.overlay_generation.saturating_add(1);
-            let transient_restore = active
-                .transient_message
-                .is_some()
-                .then(|| (active.identity(attach_pid), active.session_name.clone()));
+            // Pane output is held behind persistent overlays. Dismissal must
+            // refresh from the transcript even without a transient message.
+            let transient_restore =
+                Some((active.identity(attach_pid), active.session_name.clone()));
             (
                 active.control_tx.clone(),
                 active.render_generation,
@@ -1033,12 +1033,11 @@ impl RequestHandler {
             render_generation,
             overlay_generation,
         )));
-        self.restore_transient_message_after_persistent_clear(transient_restore)
-            .await;
+        self.refresh_after_persistent_clear(transient_restore).await;
         Ok(())
     }
 
-    async fn restore_transient_message_after_persistent_clear(
+    async fn refresh_after_persistent_clear(
         &self,
         restore: Option<(ActiveAttachIdentity, rmux_proto::SessionName)>,
     ) {
@@ -1109,12 +1108,10 @@ impl RequestHandler {
                     active.control_tx.clone(),
                     active.render_generation,
                     active.overlay_generation,
-                    active.transient_message.is_some().then(|| {
-                        (
-                            active.identity(identity.attach_pid()),
-                            active.session_name.clone(),
-                        )
-                    }),
+                    Some((
+                        active.identity(identity.attach_pid()),
+                        active.session_name.clone(),
+                    )),
                 ))
             }
         };
@@ -1125,8 +1122,7 @@ impl RequestHandler {
                 render_generation,
                 overlay_generation,
             )));
-            self.restore_transient_message_after_persistent_clear(transient_restore)
-                .await;
+            self.refresh_after_persistent_clear(transient_restore).await;
         } else {
             self.refresh_popup_overlay_for_identity(identity, popup_id)
                 .await?;
