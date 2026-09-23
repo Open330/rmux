@@ -1242,7 +1242,24 @@ fn reset_interactive_attach_state_for_session_switch(
     active.transient_message = None;
     active.transient_terminal_prefix.clear();
     active.overlay_state_id = active.overlay_state_id.saturating_add(1);
-    active.overlay.take()
+    let retired = active.overlay.take();
+    if retired.is_some() {
+        // The render loop keeps its own "an overlay is on screen" flag and
+        // holds back base-pane repaints while it is set. Retiring the overlay
+        // here without telling it latches that flag: the client lands on the
+        // new session with the old popup still drawn, and — since the pane it
+        // switched to may be idle — no later output ever arrives to lift the
+        // hold. Every other dismissal path sends this empty frame; a session
+        // switch is one too.
+        let _ = active
+            .control_tx
+            .send(AttachControl::Overlay(OverlayFrame::persistent(
+                Vec::new(),
+                active.render_generation,
+                active.overlay_generation,
+            )));
+    }
+    retired
 }
 
 fn terminate_overlay_job(overlay: Option<super::overlay_support::ClientOverlayState>) {
