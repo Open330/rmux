@@ -870,7 +870,7 @@ fn apply_sgr(state: &mut SgrState, params: &[u8]) -> Option<()> {
 /// of its character (plus any zero-width marks that follow), and its width.
 #[derive(Debug)]
 struct RowCell {
-    style: Vec<u8>,
+    style: std::rc::Rc<[u8]>,
     text: std::ops::Range<usize>,
     width: usize,
 }
@@ -883,6 +883,8 @@ fn row_cells(line: &[u8]) -> Option<Vec<Option<RowCell>>> {
     let text = std::str::from_utf8(line).ok()?;
     let mut columns: Vec<Option<RowCell>> = Vec::new();
     let mut style = SgrState::new();
+    // Rebuilt only when an SGR sequence changes it; cells share it.
+    let mut current: std::rc::Rc<[u8]> = std::rc::Rc::from(Vec::new());
     let mut last_cell: Option<usize> = None;
     let mut index = 0;
     while index < line.len() {
@@ -896,6 +898,7 @@ fn row_cells(line: &[u8]) -> Option<Vec<Option<RowCell>>> {
                 return None;
             }
             apply_sgr(&mut style, &sequence[2..sequence.len() - 1])?;
+            current = std::rc::Rc::from(style.sequence());
             index = end;
             continue;
         }
@@ -913,7 +916,7 @@ fn row_cells(line: &[u8]) -> Option<Vec<Option<RowCell>>> {
             Some(width) => {
                 last_cell = Some(columns.len());
                 columns.push(Some(RowCell {
-                    style: style.sequence(),
+                    style: std::rc::Rc::clone(&current),
                     text: index..index + len,
                     width,
                 }));
