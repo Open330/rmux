@@ -294,9 +294,13 @@ impl PaneRenderSnapshot {
             if frame.is_empty() {
                 frame.extend_from_slice(b"\x1b[s\x1b[?25l");
             }
-            frame.extend_from_slice(
-                cursor_position_bytes(next.y.saturating_add(row as u16), next.x).as_slice(),
-            );
+            let screen_row = next.y.saturating_add(row as u16);
+            if let Some(spans) = styled_row_span_delta(previous_line, next_line, screen_row, next.x)
+            {
+                frame.extend_from_slice(&spans);
+                continue;
+            }
+            frame.extend_from_slice(cursor_position_bytes(screen_row, next.x).as_slice());
             frame.extend_from_slice(b"\x1b[0m");
             let (line, clear_to_eol) =
                 compact_plain_ascii_line_delta(previous_line, next_line, full_width)
@@ -757,6 +761,246 @@ fn compact_plain_ascii_line_delta<'a>(
     Some((&next_line[..next_visible], previous_visible > next_visible))
 }
 
+/// The effective SGR state, one entry per attribute slot, so two rows that
+/// reach the same style through different sequences compare equal.
+type SgrState = std::collections::BTreeMap<u8, String>;
+
+const SGR_BOLD: u8 = 0;
+const SGR_DIM: u8 = 1;
+const SGR_ITALIC: u8 = 2;
+const SGR_UNDERLINE: u8 = 3;
+const SGR_BLINK: u8 = 4;
+const SGR_REVERSE: u8 = 5;
+const SGR_HIDDEN: u8 = 6;
+const SGR_STRIKE: u8 = 7;
+const SGR_OVERLINE: u8 = 8;
+const SGR_FOREGROUND: u8 = 9;
+const SGR_BACKGROUND: u8 = 10;
+const SGR_UNDERLINE_COLOR: u8 = 11;
+
+trait SgrSequence {
+    fn sequence(&self) -> Vec<u8>;
+}
+
+impl SgrSequence for SgrState {
+    /// The state as one SGR sequence to emit after a reset.
+    fn sequence(&self) -> Vec<u8> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let params: Vec<&str> = self.values().map(String::as_str).collect();
+        format!("\x1b[{}m", params.join(";")).into_bytes()
+    }
+}
+
+/// Apply one SGR parameter list. `None` for anything not modelled, so the
+/// row keeps the whole-row write rather than risk a wrong style.
+fn apply_sgr(state: &mut SgrState, params: &[u8]) -> Option<()> {
+    let params = std::str::from_utf8(params).ok()?;
+    if params.is_empty() {
+        state.clear();
+        return Some(());
+    }
+    let mut tokens = params.split(';');
+    while let Some(token) = tokens.next() {
+        // A colon form (`38:2::r:g:b`, `4:3`) is one self-contained token.
+        let code: u16 = token.split(':').next()?.parse().ok()?;
+        let mut set = |slot: u8, value: String| {
+            state.insert(slot, value);
+        };
+        match code {
+            0 => state.clear(),
+            1 => set(SGR_BOLD, token.to_owned()),
+            2 => set(SGR_DIM, token.to_owned()),
+            3 => set(SGR_ITALIC, token.to_owned()),
+            4 => set(SGR_UNDERLINE, token.to_owned()),
+            5 | 6 => set(SGR_BLINK, token.to_owned()),
+            7 => set(SGR_REVERSE, token.to_owned()),
+            8 => set(SGR_HIDDEN, token.to_owned()),
+            9 => set(SGR_STRIKE, token.to_owned()),
+            21 => set(SGR_UNDERLINE, token.to_owned()),
+            53 => set(SGR_OVERLINE, token.to_owned()),
+            22 => {
+                state.remove(&SGR_BOLD);
+                state.remove(&SGR_DIM);
+            }
+            23 => drop(state.remove(&SGR_ITALIC)),
+            24 => drop(state.remove(&SGR_UNDERLINE)),
+            25 => drop(state.remove(&SGR_BLINK)),
+            27 => drop(state.remove(&SGR_REVERSE)),
+            28 => drop(state.remove(&SGR_HIDDEN)),
+            29 => drop(state.remove(&SGR_STRIKE)),
+            55 => drop(state.remove(&SGR_OVERLINE)),
+            30..=37 | 90..=97 => set(SGR_FOREGROUND, token.to_owned()),
+            40..=47 | 100..=107 => set(SGR_BACKGROUND, token.to_owned()),
+            39 => drop(state.remove(&SGR_FOREGROUND)),
+            49 => drop(state.remove(&SGR_BACKGROUND)),
+            59 => drop(state.remove(&SGR_UNDERLINE_COLOR)),
+            38 | 48 | 58 => {
+                let slot = match code {
+                    38 => SGR_FOREGROUND,
+                    48 => SGR_BACKGROUND,
+                    _ => SGR_UNDERLINE_COLOR,
+                };
+                let value = if token.contains(':') {
+                    token.to_owned()
+                } else {
+                    // `38;5;n` or `38;2;r;g;b` spread over the next tokens.
+                    let kind = tokens.next()?;
+                    let count = match kind {
+                        "5" => 1,
+                        "2" => 3,
+                        _ => return None,
+                    };
+                    let mut parts = vec![token.to_owned(), kind.to_owned()];
+                    for _ in 0..count {
+                        parts.push(tokens.next()?.to_owned());
+                    }
+                    parts.join(";")
+                };
+                set(slot, value);
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+/// One terminal cell of a rendered row: the SGR state in effect, the bytes
+/// of its character (plus any zero-width marks that follow), and its width.
+#[derive(Debug)]
+struct RowCell {
+    style: Vec<u8>,
+    text: std::ops::Range<usize>,
+    width: usize,
+}
+
+/// Split a rendered row into cells indexed by start column (`None` marks the
+/// trailing columns of a wide character). `None` overall when the row holds
+/// anything but SGR sequences and printable characters (OSC hyperlinks,
+/// other CSI, control bytes): those rows keep the whole-row write.
+fn row_cells(line: &[u8]) -> Option<Vec<Option<RowCell>>> {
+    let text = std::str::from_utf8(line).ok()?;
+    let mut columns: Vec<Option<RowCell>> = Vec::new();
+    let mut style = SgrState::new();
+    let mut last_cell: Option<usize> = None;
+    let mut index = 0;
+    while index < line.len() {
+        if line[index] == 0x1b {
+            if line.get(index + 1) != Some(&b'[') {
+                return None;
+            }
+            let end = ansi_csi_end(line, index)?;
+            let sequence = &line[index..end];
+            if *sequence.last()? != b'm' {
+                return None;
+            }
+            apply_sgr(&mut style, &sequence[2..sequence.len() - 1])?;
+            index = end;
+            continue;
+        }
+        let ch = text[index..].chars().next()?;
+        let len = ch.len_utf8();
+        if ch.is_control() {
+            return None;
+        }
+        match unicode_width::UnicodeWidthChar::width(ch) {
+            Some(0) => {
+                // A zero-width mark belongs to the cell before it.
+                let cell = columns.get_mut(last_cell?)?.as_mut()?;
+                cell.text.end = index + len;
+            }
+            Some(width) => {
+                last_cell = Some(columns.len());
+                columns.push(Some(RowCell {
+                    style: style.sequence(),
+                    text: index..index + len,
+                    width,
+                }));
+                columns.extend((1..width).map(|_| None));
+            }
+            None => return None,
+        }
+        index += len;
+    }
+    Some(columns)
+}
+
+/// The number of terminal columns a rendered row occupies, when the row is
+/// made only of SGR sequences and printable characters.
+pub(crate) fn styled_row_width(line: &[u8]) -> Option<usize> {
+    row_cells(line).map(|columns| columns.len())
+}
+
+fn ansi_csi_end(line: &[u8], start: usize) -> Option<usize> {
+    line.get(start + 2..)?
+        .iter()
+        .position(|byte| (0x40..=0x7e).contains(byte))
+        .map(|offset| start + 3 + offset)
+}
+
+/// Repaint only the changed columns of a styled row, as tmux does, instead
+/// of rewriting the whole row: a one-cell change (a spinner tick) in a
+/// styled 160-column row otherwise costs the full ~2.5 KB row, several
+/// times a second.
+///
+/// Rows of different rendered width keep the whole-row path, which owns
+/// what a shorter row must clear. `None` falls back to that path.
+pub(crate) fn styled_row_span_delta(
+    previous: &[u8],
+    next: &[u8],
+    row: u16,
+    x: u16,
+) -> Option<Vec<u8>> {
+    let before = row_cells(previous)?;
+    let after = row_cells(next)?;
+    if before.len() != after.len() {
+        return None;
+    }
+    let width = after.len();
+    let same = |column: usize| match (&before[column], &after[column]) {
+        (Some(a), Some(b)) => {
+            a.width == b.width
+                && a.style == b.style
+                && previous[a.text.clone()] == next[b.text.clone()]
+        }
+        (None, None) => true,
+        _ => false,
+    };
+
+    let mut frame = Vec::new();
+    let mut column = 0;
+    while column < width {
+        if same(column) {
+            column += 1;
+            continue;
+        }
+        // Begin at the cell that owns this column in the new row.
+        let mut start = column;
+        while start > 0 && after[start].is_none() {
+            start -= 1;
+        }
+        let mut end = column;
+        while end < width && !same(end) {
+            end += 1;
+        }
+        // Finish a wide cell the run ends inside.
+        while end < width && after[end].is_none() {
+            end += 1;
+        }
+        let first = after[start].as_ref()?;
+        let last = after[start..end].iter().rev().find_map(Option::as_ref)?;
+        let column_offset = u16::try_from(start).ok()?;
+        frame.extend_from_slice(&cursor_position_bytes(row, x.saturating_add(column_offset)));
+        frame.extend_from_slice(b"\x1b[0m");
+        frame.extend_from_slice(&first.style);
+        frame.extend_from_slice(&next[first.text.start..last.text.end]);
+        column = end;
+    }
+    // Only when it actually beats rewriting the row.
+    (frame.len() < next.len()).then_some(frame)
+}
+
 fn is_plain_ascii_render_line(line: &[u8]) -> bool {
     line.iter().all(|byte| matches!(*byte, b' '..=b'~' | b'\t'))
 }
@@ -877,6 +1121,160 @@ mod tests {
             .iter()
             .map(|line| Arc::new((*line).to_vec()))
             .collect()
+    }
+
+    const ROW_WIDTH: u16 = 40;
+
+    /// The row an application's output renders to, in the exact serialized
+    /// form the delta compares.
+    fn rendered_row(output: &str) -> Vec<u8> {
+        let mut screen = Screen::new(
+            TerminalSize {
+                cols: ROW_WIDTH,
+                rows: 1,
+            },
+            0,
+        );
+        InputParser::new().parse(output.as_bytes(), &mut screen);
+        screen
+            .render_visible_line_independent(0, super::pane_render_options())
+            .expect("row 0 renders")
+    }
+
+    /// Paint `previous` on a client screen, apply the span delta, and require
+    /// the result to equal `next` painted from scratch.
+    fn assert_span_delta_replays(previous: &str, next: &str) -> Vec<u8> {
+        let (before, after) = (rendered_row(previous), rendered_row(next));
+        let delta = super::styled_row_span_delta(&before, &after, 0, 0).unwrap_or_else(|| {
+            panic!(
+                "styled rows of equal width use the span delta: {:?} -> {:?}",
+                String::from_utf8_lossy(&before),
+                String::from_utf8_lossy(&after)
+            )
+        });
+        let mut client = Screen::new(
+            TerminalSize {
+                cols: ROW_WIDTH,
+                rows: 1,
+            },
+            0,
+        );
+        let mut parser = InputParser::new();
+        parser.parse(b"\x1b[1;1H\x1b[0m", &mut client);
+        parser.parse(&before, &mut client);
+        parser.parse(&delta, &mut client);
+        assert_eq!(
+            String::from_utf8_lossy(
+                &client
+                    .render_visible_line_independent(0, super::pane_render_options())
+                    .expect("row 0 renders")
+            ),
+            String::from_utf8_lossy(&after),
+            "delta {:?}",
+            String::from_utf8_lossy(&delta)
+        );
+        delta
+    }
+
+    #[test]
+    fn a_spinner_tick_repaints_one_cell_not_the_row() {
+        let row = |spinner: &str| {
+            format!(
+                "\x1b[38;5;8m│\x1b[1;33m{spinner}\x1b[0m rmux:%196 \x1b[1mclaude\x1b[0m   WORK   9m"
+            )
+        };
+        let delta = assert_span_delta_replays(&row("⠧"), &row("⠇"));
+        let full = rendered_row(&row("⠇")).len();
+        assert!(
+            delta.len() * 2 < full,
+            "one cell, not the {full}-byte row: {:?}",
+            String::from_utf8_lossy(&delta)
+        );
+    }
+
+    #[test]
+    fn wide_and_combining_characters_keep_their_columns() {
+        assert_span_delta_replays("배포 \x1b[32m⠧\x1b[0m 확인", "배포 \x1b[32m⠇\x1b[0m 확인");
+        assert_span_delta_replays("ab 한글 x", "ab 한국 x");
+        assert_span_delta_replays("한 x", "ab x");
+        assert_span_delta_replays("ab x", "한 x");
+        assert_span_delta_replays("e\u{301} done", "e\u{300} done");
+    }
+
+    #[test]
+    fn a_style_change_alone_is_repainted() {
+        assert_span_delta_replays("\x1b[31mERROR\x1b[0m state", "\x1b[32mERROR\x1b[0m state");
+        assert_span_delta_replays("plain ", "\x1b[7mplain\x1b[0m ");
+    }
+
+    /// Random rows of ASCII, braille, Korean, combining marks and SGR with
+    /// random edits: whenever the span delta applies, it must replay exactly.
+    #[test]
+    fn random_styled_edits_always_replay_exactly() {
+        let pieces = [
+            "a",
+            "Z",
+            " ",
+            "│",
+            "⠧",
+            "⠇",
+            "○",
+            "한",
+            "글",
+            "e\u{301}",
+            "\x1b[1m",
+            "\x1b[22m",
+            "\x1b[31m",
+            "\x1b[38;5;8m",
+            "\x1b[38;2;1;2;3m",
+            "\x1b[48;5;236m",
+            "\x1b[39m",
+            "\x1b[0m",
+            "\x1b[7m",
+            "\x1b[4:3m",
+        ];
+        let mut seed = 0x2545_f491_u64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            usize::try_from(seed % bound as u64).expect("small")
+        };
+        let mut applied = 0;
+        for _ in 0..2000 {
+            let len = 4 + next(14);
+            let row: Vec<&str> = (0..len).map(|_| pieces[next(pieces.len())]).collect();
+            let mut edited = row.clone();
+            for _ in 0..1 + next(3) {
+                let at = next(edited.len());
+                edited[at] = pieces[next(pieces.len())];
+            }
+            let (previous, edited) = (row.concat(), edited.concat());
+            let (before, after) = (rendered_row(&previous), rendered_row(&edited));
+            if super::styled_row_span_delta(&before, &after, 0, 0).is_some() {
+                assert_span_delta_replays(&previous, &edited);
+                applied += 1;
+            }
+        }
+        assert!(applied > 500, "span delta exercised only {applied} times");
+    }
+
+    #[test]
+    fn equivalent_sgr_spellings_are_the_same_style() {
+        let delta =
+            assert_span_delta_replays("\x1b[1;33mok\x1b[0m x", "\x1b[1m\x1b[33mok\x1b[0m y");
+        assert!(
+            !String::from_utf8_lossy(&delta).contains("ok"),
+            "only the changed cell: {:?}",
+            String::from_utf8_lossy(&delta)
+        );
+    }
+
+    #[test]
+    fn rows_the_span_delta_cannot_model_keep_the_whole_row_write() {
+        assert!(super::styled_row_span_delta(b"\x1b]8;;u\x07a", b"\x1b]8;;u\x07b", 0, 0).is_none());
+        assert!(super::styled_row_span_delta(b"\x1b[2Ka", b"\x1b[2Kb", 0, 0).is_none());
+        assert!(super::styled_row_span_delta(b"abc", b"abcd", 0, 0).is_none());
     }
 
     #[test]

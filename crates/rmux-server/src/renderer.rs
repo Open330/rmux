@@ -61,6 +61,7 @@ pub(crate) use overlay::{
     MenuRenderItem, MenuRenderSpec, OverlayMousePosition, OverlayPositionContext, OverlayRect,
     PopupContent, PopupRenderSpec,
 };
+pub(crate) use pane_delta::{styled_row_span_delta, styled_row_width};
 pub(crate) use pane_delta::{PaneRenderDelta, PaneRenderDeltaFrame, PaneRenderSnapshot};
 pub(crate) use pane_screen::{
     pane_default_style, render_copy_mode_pane_screen,
