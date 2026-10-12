@@ -262,9 +262,13 @@ fn overlay_matches_switch(
         && overlay.overlay_generation >= current_overlay_generation
 }
 
-/// Diff only self-contained, ordered popup rows, against the last frame that
-/// was actually emitted. Never cache a delta: switches and refresh-client must
-/// still be able to restore the entire popup, including unchanged rows.
+/// Diff only self-contained popup records, against the last frame that was
+/// actually emitted. Never cache a delta: switches and refresh-client must
+/// still be able to restore the entire popup, including unchanged records.
+///
+/// A changed record is re-sent alone, and a changed styled row only for the
+/// columns that changed: a one-cell spinner tick in a bordered popup used to
+/// resend the whole popup, several times a second.
 pub(super) fn popup_frame_delta(
     cache: Option<&[u8]>,
     visible: bool,
@@ -278,46 +282,104 @@ pub(super) fn popup_frame_delta(
     if before.len() != after.len() || before.iter().zip(&after).any(|(a, b)| a.0 != b.0) {
         return None;
     }
-    Some(
-        before
-            .iter()
-            .zip(&after)
-            .filter(|(a, b)| a.1 != b.1)
-            .flat_map(|(_, row)| row.1.iter().copied())
-            .collect(),
-    )
+    let mut delta = Vec::new();
+    for (previous, next) in before.iter().zip(&after) {
+        if previous.1 == next.1 {
+            continue;
+        }
+        match record_span_delta(previous.1, next.1) {
+            Some(spans) => delta.extend_from_slice(&spans),
+            None => delta.extend_from_slice(next.1),
+        }
+    }
+    Some(delta)
 }
 
-/// The popup renderer saves/restores the cursor and resets SGR for each row.
-/// Require one strictly increasing row at a fixed column. Borders, nested
-/// menus, transient messages, and other command layouts conservatively fall
-/// back to a full frame rather than skipping overlapping drawing operations.
+/// Self-contained popup records: each saves the cursor (`ESC 7` or `CSI s`),
+/// resets SGR, positions, draws, resets SGR and restores the cursor. Content
+/// rows and border edges use the two save forms.
+///
+/// Records may only be diffed independently when none overdraws another, so
+/// records sharing a row must have measurable, disjoint column spans.
+/// Anything else (nested menus, transient messages, unknown layouts) falls
+/// back to a full frame.
 fn popup_rows(frame: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
     let mut rest = frame;
     let mut rows = Vec::new();
-    let mut last_y = 0;
-    let mut column = None;
+    let mut spans: Vec<(u16, u16, Option<usize>)> = Vec::new();
     while !rest.is_empty() {
-        let position = rest.strip_prefix(b"\x1b7\x1b[0m\x1b[")?;
+        let (position, end_marker) = if let Some(position) = rest.strip_prefix(b"\x1b7\x1b[0m\x1b[")
+        {
+            (position, &b"\x1b[0m\x1b8"[..])
+        } else {
+            (
+                rest.strip_prefix(b"\x1b[s\x1b[0m\x1b[")?,
+                &b"\x1b[0m\x1b[u"[..],
+            )
+        };
         let h = position.iter().position(|byte| *byte == b'H')?;
         let coordinates = std::str::from_utf8(&position[..h]).ok()?;
         let (y, x) = coordinates.split_once(';')?;
         let y: u16 = y.parse().ok()?;
         let x: u16 = x.parse().ok()?;
-        if y <= last_y || column.is_some_and(|col| col != x) {
-            return None;
-        }
-        last_y = y;
-        column = Some(x);
-        let end = rest.windows(2).position(|pair| pair == b"\x1b8")? + 2;
+        let header = rest.len() - position.len() + h + 1;
+        let end = rest[header..]
+            .windows(end_marker.len())
+            .position(|window| window == end_marker)?
+            + header
+            + end_marker.len();
         let row = &rest[..end];
-        if !row.ends_with(b"\x1b[0m\x1b8") {
-            return None;
-        }
-        rows.push((&position[..=h], row));
+        let body = &rest[header..end - end_marker.len()];
+        spans.push((y, x, crate::renderer::styled_row_width(body)));
+        rows.push((&rest[..header], row));
         rest = &rest[end..];
     }
+    if !records_are_disjoint(&mut spans) {
+        return None;
+    }
     (!rows.is_empty()).then_some(rows)
+}
+
+fn records_are_disjoint(spans: &mut [(u16, u16, Option<usize>)]) -> bool {
+    spans.sort_by_key(|(y, x, _)| (*y, *x));
+    spans.windows(2).all(|pair| {
+        let ((y1, x1, width), (y2, x2, _)) = (pair[0], pair[1]);
+        y1 != y2 || width.is_some_and(|width| usize::from(x1) + width <= usize::from(x2))
+    })
+}
+
+/// Repaint only the changed columns of one styled popup record, keeping the
+/// record's cursor save/restore and SGR reset around the spans.
+fn record_span_delta(previous: &[u8], next: &[u8]) -> Option<Vec<u8>> {
+    let (open, close): (&[u8], &[u8]) = if next.starts_with(b"\x1b7") {
+        (b"\x1b7", b"\x1b[0m\x1b8")
+    } else {
+        (b"\x1b[s", b"\x1b[0m\x1b[u")
+    };
+    let body = |record: &'_ [u8]| -> Option<(u16, u16, std::ops::Range<usize>)> {
+        let after_reset = record.strip_prefix(open)?.strip_prefix(b"\x1b[0m\x1b[")?;
+        let h = after_reset.iter().position(|byte| *byte == b'H')?;
+        let (y, x) = std::str::from_utf8(&after_reset[..h])
+            .ok()?
+            .split_once(';')?;
+        let start = record.len() - after_reset.len() + h + 1;
+        let end = record.len().checked_sub(close.len())?;
+        record.ends_with(close).then_some(())?;
+        Some((y.parse().ok()?, x.parse().ok()?, start..end))
+    };
+    let (y, x, before) = body(previous)?;
+    let (_, _, after) = body(next)?;
+    let spans = crate::renderer::styled_row_span_delta(
+        &previous[before],
+        &next[after],
+        y.checked_sub(1)?,
+        x.checked_sub(1)?,
+    )?;
+    let mut delta = Vec::with_capacity(open.len() + spans.len() + close.len());
+    delta.extend_from_slice(open);
+    delta.extend_from_slice(&spans);
+    delta.extend_from_slice(close);
+    (delta.len() < next.len()).then_some(delta)
 }
 
 pub(super) fn update_persistent_overlay_cache(
@@ -551,18 +613,23 @@ mod popup_delta_tests {
     use rmux_proto::TerminalSize;
 
     fn popup(rows: &[&str]) -> OverlayFrame {
+        popup_with(rows, BoxLines::None)
+    }
+
+    fn popup_with(rows: &[&str], border_lines: BoxLines) -> OverlayFrame {
+        let border = u16::from(border_lines != BoxLines::None) * 2;
         OverlayFrame::persistent(
             render_popup_overlay(&PopupRenderSpec {
                 rect: OverlayRect {
                     x: 2,
                     y: 2,
-                    width: 20,
-                    height: 3,
+                    width: 20 + border,
+                    height: 3 + border,
                 },
                 title: String::new(),
                 style: Style::default(),
                 border_style: Style::default(),
-                border_lines: BoxLines::None,
+                border_lines,
                 content: PopupContent::Surface(
                     rows.iter().map(|r| r.as_bytes().to_vec()).collect(),
                 ),
@@ -608,6 +675,47 @@ mod popup_delta_tests {
         let cleared = popup(&["unchanged", "", "last"]);
         let delta = popup_frame_delta(Some(&after.frame), true, &cleared).unwrap();
         assert_eq!(screen(&[&after.frame, &delta]), screen(&[&cleared.frame]));
+    }
+
+    /// The `muxa watch` popup: a bordered popup whose rows change by one
+    /// spinner cell. It used to resend the whole popup on every tick.
+    #[test]
+    fn bordered_popup_spinner_tick_sends_one_cell() {
+        let row = |spinner: &str| format!("\x1b[1;33m{spinner}\x1b[0m 2 \x1b[32m○\x1b[0m4 callabo");
+        for lines in [BoxLines::Single, BoxLines::Rounded, BoxLines::Double] {
+            let before = popup_with(&["header", &row("⠧"), "last"], lines);
+            let after = popup_with(&["header", &row("⠇"), "last"], lines);
+            let delta = popup_frame_delta(Some(&before.frame), true, &after)
+                .expect("a bordered popup diffs record by record");
+            assert!(
+                delta.len() < 40,
+                "{lines:?}: one cell, not the {}-byte popup: {:?}",
+                after.frame.len(),
+                String::from_utf8_lossy(&delta)
+            );
+            assert_eq!(screen(&[&before.frame, &delta]), screen(&[&after.frame]));
+        }
+    }
+
+    #[test]
+    fn bordered_popup_rows_of_any_shape_replay_exactly() {
+        let cases = [
+            ("short", "a much longer replacement row"),
+            ("\x1b[31m긴 문자열 abcdef", "\x1b[32m짧음"),
+            ("plain", "\x1b[7mreverse\x1b[0m tail"),
+            ("e\u{301}x", "e\u{300}x"),
+            ("한글", "ab"),
+        ];
+        for (old_row, new_row) in cases {
+            let before = popup_with(&["one", old_row, "three"], BoxLines::Single);
+            let after = popup_with(&["one", new_row, "three"], BoxLines::Single);
+            let delta = popup_frame_delta(Some(&before.frame), true, &after).unwrap();
+            assert_eq!(
+                screen(&[&before.frame, &delta]),
+                screen(&[&after.frame]),
+                "{old_row:?} -> {new_row:?}"
+            );
+        }
     }
 
     #[test]
