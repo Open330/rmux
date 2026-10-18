@@ -262,7 +262,12 @@ impl PaneRenderSnapshot {
         })
     }
 
-    pub(crate) fn diff_to(&self, next: &Self) -> PaneRenderDelta {
+    /// The frame that turns this snapshot's screen into `next`'s.
+    /// `cell_spans` allows repainting only the changed cells of a styled
+    /// row; it must be off unless the session uses rmux's default
+    /// character widths, which is all the cell model knows (see
+    /// [`row_cells`]).
+    pub(crate) fn diff_to(&self, next: &Self, cell_spans: bool) -> PaneRenderDelta {
         if self.requires_full_refresh(next) {
             return PaneRenderDelta::RequiresFullRefresh;
         }
@@ -295,7 +300,9 @@ impl PaneRenderSnapshot {
                 frame.extend_from_slice(b"\x1b[s\x1b[?25l");
             }
             let screen_row = next.y.saturating_add(row as u16);
-            if let Some(spans) = styled_row_span_delta(previous_line, next_line, screen_row, next.x)
+            if let Some(spans) = cell_spans
+                .then(|| styled_row_span_delta(previous_line, next_line, screen_row, next.x))
+                .flatten()
             {
                 frame.extend_from_slice(&spans);
                 continue;
@@ -904,7 +911,7 @@ fn row_cells(line: &[u8]) -> Option<Vec<Option<RowCell>>> {
         }
         let ch = text[index..].chars().next()?;
         let len = ch.len_utf8();
-        if ch.is_control() {
+        if ch.is_control() || !width_is_model_independent(ch) {
             return None;
         }
         match unicode_width::UnicodeWidthChar::width(ch) {
@@ -912,6 +919,10 @@ fn row_cells(line: &[u8]) -> Option<Vec<Option<RowCell>>> {
                 // A zero-width mark belongs to the cell before it.
                 let cell = columns.get_mut(last_cell?)?.as_mut()?;
                 cell.text.end = index + len;
+                // rmux-core stops combining past this many bytes.
+                if cell.text.len() > MAX_COMBINED_CELL_BYTES {
+                    return None;
+                }
             }
             Some(width) => {
                 last_cell = Some(columns.len());
@@ -927,6 +938,31 @@ fn row_cells(line: &[u8]) -> Option<Vec<Option<RowCell>>> {
         index += len;
     }
     Some(columns)
+}
+
+/// rmux-core's `MAX_COMBINED_BYTES`: the longest cell it builds.
+const MAX_COMBINED_CELL_BYTES: usize = 21;
+
+/// Whether `ch` takes the same number of columns in rmux-core's width model
+/// (with default options) as in plain `unicode-width`, and cannot change
+/// the width of the cell before it. Everything else makes [`row_cells`]
+/// give up, so the row keeps the whole-row write: rmux-core widens some
+/// emoji by its override table, joins ZWJ sequences, flags and skin tones
+/// into one cell, widens a character a VS16 follows, and composes Hangul
+/// jamo. A cell measured differently from the server's grid would put the
+/// delta's text in the wrong column.
+fn width_is_model_independent(ch: char) -> bool {
+    let codepoint = u32::from(ch);
+    !(codepoint >= 0x1_0000
+        || codepoint == 0x200D
+        || (0xFE00..=0xFE0F).contains(&codepoint)
+        || codepoint == 0x3164
+        || (0x1100..=0x11FF).contains(&codepoint)
+        || (0xA960..=0xA97F).contains(&codepoint)
+        || (0xD7B0..=0xD7FF).contains(&codepoint)
+        || codepoint == 0x261D
+        || codepoint == 0x26F9
+        || (0x270A..=0x270D).contains(&codepoint))
 }
 
 /// The number of terminal columns a rendered row occupies, when the row is
@@ -1274,6 +1310,31 @@ mod tests {
     }
 
     #[test]
+    fn rows_whose_widths_rmux_measures_differently_keep_the_whole_row_write() {
+        // Each of these is one cell in rmux-core but not in plain
+        // unicode-width (or the reverse), so a span delta would put the
+        // changed text in the wrong column.
+        for prefix in [
+            "\u{261D}",
+            "\u{270C}",
+            "\u{2764}\u{FE0F}",
+            "\u{1F44D}\u{1F3FD}",
+            "\u{1F468}\u{200D}\u{1F469}",
+            "\u{1F1F0}\u{1F1F7}",
+            "\u{1100}\u{1161}",
+        ] {
+            let before = rendered_row(&format!("\x1b[1m{prefix}\x1b[0m ab"));
+            let after = rendered_row(&format!("\x1b[1m{prefix}\x1b[0m ac"));
+            assert!(
+                super::styled_row_span_delta(&before, &after, 0, 0).is_none(),
+                "{prefix:?} must fall back"
+            );
+        }
+        // Precomposed Hangul and CJK agree in both models.
+        assert_span_delta_replays("\x1b[1m\u{AC00}\x1b[0m ab", "\x1b[1m\u{AC00}\x1b[0m ac");
+    }
+
+    #[test]
     fn rows_the_span_delta_cannot_model_keep_the_whole_row_write() {
         assert!(super::styled_row_span_delta(b"\x1b]8;;u\x07a", b"\x1b]8;;u\x07b", 0, 0).is_none());
         assert!(super::styled_row_span_delta(b"\x1b[2Ka", b"\x1b[2Kb", 0, 0).is_none());
@@ -1306,7 +1367,7 @@ mod tests {
             ..before.clone()
         };
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("cursor move should stay incremental");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
@@ -1356,7 +1417,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("line update should not require a full refresh");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
@@ -1386,7 +1447,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("history update should stay incremental");
         };
 
@@ -1415,7 +1476,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("composed-cell repaint should stay incremental");
         };
         let frame = String::from_utf8(delta.frame().to_vec()).expect("delta frame is utf-8");
@@ -1438,7 +1499,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("short ASCII output should stay incremental");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
@@ -1463,7 +1524,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("line advance should stay incremental");
         };
 
@@ -1622,7 +1683,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("line shrink should stay incremental");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
@@ -1662,7 +1723,7 @@ mod tests {
             ..before.clone()
         };
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("split pane shrink should stay incremental");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
@@ -1688,7 +1749,7 @@ mod tests {
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
         assert_eq!(
-            before.diff_to(&after),
+            before.diff_to(&after, true),
             PaneRenderDelta::Incremental(super::PaneRenderDeltaFrame {
                 frame: Vec::new(),
                 cursor_style: None,
@@ -1708,7 +1769,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("new shell prompt lines should not force a full refresh");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
@@ -1733,7 +1794,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &screen).expect("snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("scrolling a full-width pane should stay incremental");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
@@ -1856,7 +1917,7 @@ mod tests {
             .expect("line is utf8")
             .contains("four"));
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("scrolling a full-width pane should stay incremental");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
@@ -1941,7 +2002,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("cursor visibility change should stay incremental");
         };
 
@@ -1981,7 +2042,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("style-only row changes should repaint incrementally");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
@@ -2003,7 +2064,7 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after, true) else {
             panic!("changed rows should repaint incrementally");
         };
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
