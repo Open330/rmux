@@ -10,6 +10,9 @@ pub(crate) struct LivePaneRender {
     pane: Pane,
     snapshot: PaneRenderSnapshot,
     plain_output_forwarding_safe: bool,
+    /// The session uses rmux's default character widths, the only ones
+    /// the styled-row cell delta models.
+    default_widths: bool,
 }
 
 impl LivePaneRender {
@@ -45,6 +48,8 @@ impl LivePaneRender {
                 )
             }
         };
+        let default_widths =
+            rmux_core::Utf8Config::from_options(&options) == rmux_core::Utf8Config::default();
         Some(Box::new(Self {
             transcript,
             session,
@@ -52,6 +57,7 @@ impl LivePaneRender {
             pane,
             snapshot,
             plain_output_forwarding_safe,
+            default_widths,
         }))
     }
 
@@ -71,7 +77,7 @@ impl LivePaneRender {
                 cursor_style,
             ));
         }
-        let delta = self.snapshot.diff_to(&next);
+        let delta = self.snapshot.diff_to(&next, self.default_widths);
         if matches!(delta, PaneRenderDelta::Incremental(_)) {
             self.snapshot = next;
             self.plain_output_forwarding_safe = plain_output_forwarding_safe;

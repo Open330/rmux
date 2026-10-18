@@ -677,11 +677,11 @@ mod popup_delta_tests {
         assert_eq!(screen(&[&after.frame, &delta]), screen(&[&cleared.frame]));
     }
 
-    /// The `muxa watch` popup: a bordered popup whose rows change by one
+    /// A dashboard-style popup: a bordered popup whose rows change by one
     /// spinner cell. It used to resend the whole popup on every tick.
     #[test]
     fn bordered_popup_spinner_tick_sends_one_cell() {
-        let row = |spinner: &str| format!("\x1b[1;33m{spinner}\x1b[0m 2 \x1b[32m○\x1b[0m4 callabo");
+        let row = |spinner: &str| format!("\x1b[1;33m{spinner}\x1b[0m 2 \x1b[32m○\x1b[0m4 project");
         for lines in [BoxLines::Single, BoxLines::Rounded, BoxLines::Double] {
             let before = popup_with(&["header", &row("⠧"), "last"], lines);
             let after = popup_with(&["header", &row("⠇"), "last"], lines);
