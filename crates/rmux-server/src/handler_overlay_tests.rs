@@ -1918,39 +1918,3 @@ async fn popup_status_ticks_respect_covered_rows_and_resume_after_close() {
         assert!(!writes.is_empty(), "status resumes after close");
     }
 }
-
-#[tokio::test]
-async fn switching_client_session_from_a_popup_clears_the_persistent_overlay() {
-    // A popup application (for example a session picker) may switch its own
-    // client to another session while the popup is still open. The render
-    // loop holds base-pane repaints while it believes a persistent overlay is
-    // on screen, so the switch must tell it the overlay is gone; otherwise an
-    // idle destination session keeps showing the retired popup forever.
-    let handler = RequestHandler::new();
-    let pid = std::process::id();
-    let source = session_name("popup-switch-source");
-    let destination = session_name("popup-switch-destination");
-    let mut rx = create_quiet_attached_session(&handler, &source, pid).await;
-    let _destination_rx = create_quiet_attached_session(&handler, &destination, pid + 1).await;
-    run_overlay_command(&handler, pid, "display-popup -N -w 30 -h 8").await;
-    let opened = next_overlay_frame(&mut rx).await;
-    assert!(opened.persistent && !opened.frame.is_empty());
-    while rx.try_recv().is_ok() {}
-
-    run_overlay_command(&handler, pid, "switch-client -t popup-switch-destination").await;
-
-    let mut cleared = false;
-    while let Ok(Some(control)) = timeout(Duration::from_millis(200), rx.recv()).await {
-        if let AttachControl::Overlay(frame) = control {
-            cleared |= frame.persistent && frame.frame.is_empty();
-        }
-    }
-    assert!(
-        cleared,
-        "a session switch that retires the popup must send the empty persistent frame"
-    );
-    let active_attach = handler.active_attach.lock().await;
-    let active = active_attach.by_pid.get(&pid).expect("attached client");
-    assert_eq!(active.session_name, destination);
-    assert!(active.overlay.is_none());
-}

@@ -246,7 +246,7 @@ pub(crate) async fn forward_attach(
     let mut current_target = open_attach_target(target, render_stream)?;
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut pane_refresh = AttachRefreshScheduler::default();
@@ -760,11 +760,13 @@ pub(crate) async fn forward_attach(
                             // Popups/menus own the visible surface until dismissal.
                             // A timer queued before the overlay opened must not paint
                             // the base pane underneath it and then restore the overlay.
-                            if persistent_overlay_visible || persistent_overlay.is_some() {
+                            if persistent_overlay.as_ref().is_some_and(|overlay| overlay.defer_pane_updates) {
                                 pane_refresh_requires_full = true;
                                 continue;
                             }
                             let force_full_refresh = pane_refresh_requires_full
+                                || persistent_overlay_visible
+                                || persistent_overlay.is_some()
                                 || current_target.live_pane.is_none();
                             pane_refresh_requires_full = false;
                             if force_full_refresh {
@@ -1361,11 +1363,14 @@ pub(crate) async fn forward_attach(
                             continue;
                         }
                         AttachOutputBatch::Gap => {
-                            if persistent_overlay_visible || persistent_overlay.is_some() {
+                            if persistent_overlay.as_ref().is_some_and(|overlay| overlay.defer_pane_updates) {
                                 pane_refresh_requires_full = true;
                                 continue;
                             }
-                            if current_target.live_pane.is_none() {
+                            if current_target.live_pane.is_none()
+                                || persistent_overlay_visible
+                                || persistent_overlay.is_some()
+                            {
                                 pane_refresh_requires_full = true;
                             }
                             pane_refresh.schedule_sustained();
@@ -1511,10 +1516,12 @@ pub(crate) async fn forward_attach(
                             }
                             if persistent_overlay_visible || persistent_overlay.is_some() {
                                 defer_passthroughs(&mut deferred_passthroughs, passthroughs);
-                                // Continue draining output into the transcript without
-                                // repainting the obscured pane. Clearing the overlay
-                                // requests a fresh base snapshot, including these bytes.
+                                // Popup/menu frames hold base paints until dismissal.
+                                // Other persistent overlays still need normal refreshes.
                                 pane_refresh_requires_full = true;
+                                if !persistent_overlay.as_ref().is_some_and(|overlay| overlay.defer_pane_updates) {
+                                    pane_refresh.schedule_now();
+                                }
                                 if close_after_render {
                                     current_target.pane_output = None;
                                 }
@@ -1631,7 +1638,7 @@ async fn synchronize_persistent_overlay_epoch(
     attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
     deferred_controls: &mut VecDeque<AttachControl>,
     control_backlog: &AtomicUsize,
-    persistent_overlay: &mut Option<Vec<u8>>,
+    persistent_overlay: &mut Option<OverlayFrame>,
     persistent_overlay_visible: &mut bool,
     persistent_overlay_state_id: &mut Option<u64>,
 ) -> io::Result<()> {
